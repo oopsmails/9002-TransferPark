@@ -116,3 +116,54 @@ sftpClient.withSftp(channel -> {
 ✔ Clear ownership
 ✔ Still thread-safe
 
+
+
+@Component
+public class SftpSessionFactory {
+
+    private final SftpProperties props;
+
+    public SftpSessionFactory(SftpProperties props) {
+        this.props = props;
+    }
+
+    public Session createSession() throws JSchException {
+        JSch jsch = new JSch();
+
+        if (props.getKnownHostsPath() != null) {
+            jsch.setKnownHosts(props.getKnownHostsPath());
+        }
+
+        if (props.getPrivateKeyPath() != null) {
+            if (props.getPrivateKeyPassphrase() != null) {
+                jsch.addIdentity(
+                    props.getPrivateKeyPath(),
+                    props.getPrivateKeyPassphrase()
+                );
+            } else {
+                jsch.addIdentity(props.getPrivateKeyPath());
+            }
+        }
+
+        Session session = jsch.getSession(
+            props.getUsername(),
+            props.getHost(),
+            props.getPort()
+        );
+
+        if (props.getPassword() != null) {
+            session.setPassword(props.getPassword());
+        }
+
+        Properties config = new Properties();
+        config.put(
+            "StrictHostKeyChecking",
+            props.isStrictHostKeyChecking() ? "yes" : "no"
+        );
+        session.setConfig(config);
+
+        return session; // 👈 NOT connected yet
+    }
+}
+
+
