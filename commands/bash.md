@@ -18,8 +18,31 @@ find . -type f -name "*.log" -exec jq -c 'select(.duration > 3) | {name: .name, 
 - A2
 
 ```
+- v1
 
 find . -type f -name "*.log" -exec awk -F'[:,]' '/"duration":[ ]*[4-9]|[1-9][0-9]+/ {for(i=1;i<=NF;i++) if($i ~ /"name"/) n=$(i+1); for(i=1;i<=NF;i++) if($i ~ /"duration"/) d=$(i+1); print "name:" n ", duration:" d}' {} +
+
+- v2
+
+find . -type f -name "*.log" -exec awk -F'[:,]' '
+{
+    name=""; duration=0;
+    for(i=1; i<=NF; i++) {
+        if($i ~ /"name"/) {
+            # Take the next field, remove quotes and leading/trailing whitespace
+            name=$(i+1); gsub(/[ "]+/, "", name);
+        }
+        if($i ~ /"duration"/) {
+            # Take the next field, remove quotes and whitespace
+            d_val=$(i+1); gsub(/[ "]+/, "", d_val);
+            duration=d_val+0; # Convert to a number
+        }
+    }
+    if(duration > 3) {
+        print "name: " name ", duration: " duration
+    }
+}' {} +
+
 
 ```
 
