@@ -1,577 +1,64 @@
-Gemini
-Spring Boot Remote File Monitoring Design
-Conversation with Gemini
-You said
-Working on a spring boot application, I want to design a feature , that monitoring a remote folder to see if there is new file comes in ... DB can be used ... Please give a high level design
+import com.jcraft.jsch.*;
+import org.springframework.stereotype.Service;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Vector;
 
-Gemini said
-Designing a file monitoring system in Spring Boot requires a balance between responsiveness (detecting files quickly) and reliability (ensuring no file is processed twice or lost during a crash).
-
-Using a database as a "State Store" is a smart move—it acts as your source of truth to prevent duplicate processing in case your application restarts.
-
-High-Level Architecture
-The design follows a Poll-and-Check pattern. Since you mentioned a "remote" folder, standard OS file listeners (like WatchService) often fail over network protocols (NFS/SMB), making scheduled polling the more robust choice.
-
-1. Components
-Remote Storage: The source (S3, SFTP, or a Network Share).
-
-Scheduler: A Spring @Scheduled task that triggers the scan.
-
-File Metadata Table: A DB table storing file_name, file_hash (optional but recommended), last_modified, and status (PENDING, PROCESSING, COMPLETED).
-
-Processor: The service that handles the actual file logic.
-
-The Workflow
-Phase A: The Discovery Phase
-Poll: The Scheduler wakes up every X minutes.
-
-List: It fetches a list of file names and timestamps from the remote folder.
-
-Filter: For every file found, the system queries the DB:
-
-Does this filename + size/timestamp exist?
-
-If No: It’s a new file. Create a record in the DB with status PENDING.
-
-If Yes: Skip it (already processed).
-
-Phase B: The Processing Phase
-Lock: Pick PENDING records. Use an UPDATE ... WHERE status = 'PENDING' or a pessimistic lock to ensure that if you scale to multiple app instances, only one instance grabs the file.
-
-Download & Action: Download the file to a temporary local directory and perform your business logic.
-
-Cleanup/Archive: Move the remote file to a /processed folder (best practice) and update the DB status to COMPLETED.
-
-Database Schema Suggestion
-Column	Type	Description
-id	UUID/Long	Primary Key
-file_name	String	Original name of the file
-checksum	String	MD5/SHA hash to detect if a file was replaced with a new version
-status	Enum	NEW, IN_PROGRESS, COMPLETED, FAILED
-retry_count	Integer	Tracks attempts if the processing fails
-created_at	Timestamp	When the file was first detected
-Tech Stack Recommendations
-Option 1: The "Manual" Way (More Control)
-Use Spring Task Scheduling. It's lightweight and easy to debug. You manually handle the File or SftpClient logic and use Spring Data JPA for the DB interactions.
-
-Option 2: Spring Integration (The Pro Way)
-Spring has a sub-project called Spring Integration specifically for this. It has built-in "Adapters" for File, FTP, and SFTP.
-
-Inbound Channel Adapter: Automatically polls a directory.
-
-Metadata Store: You can configure it to use your JdbcMetadataStore. This handles the "have I seen this file before?" logic automatically using your database.
-
-Critical Considerations
-Atomic Moves: When a file is being uploaded to the remote folder, it might appear in the list before it's fully written. Design Tip: Only process files that haven't changed in size for at least two consecutive scans, or look for a "completion" flag file (e.g., data.csv.done).
-
-Idempotency: If the app crashes halfway through, the DB entry will stay IN_PROGRESS. You’ll need a "Recovery" task to reset stuck records after a certain timeout.
-
-Would you like to see a code snippet for the Scheduled task or a specific Spring Integration configuration?
-
-You said
-I don't want to use Spring Integration, i.e, I would choose Option 1 ... so, does this mean I need to "open sftp session" twice? for phase a and b.
-
-Gemini said
-Going with Option 1 is a solid choice for maintaining full control over the logic. To answer your question directly: Yes and No.
-
-While you technically need to perform two logical actions (listing and downloading), you definitely do not want to open and close a connection twice. That creates unnecessary overhead and puts strain on the remote server.
-
-Here is how you handle the SFTP session lifecycle efficiently:
-
-1. The Single-Session Strategy
-Instead of opening a connection for the scan and another for the download, you should wrap the entire "Phase A + Phase B" cycle within a single session.
-
-The Implementation Logic
-Open Connection: The Scheduler triggers and opens one SFTP session.
-
-Phase A (List & Filter): * List all files in the directory.
-
-Compare the list against your DB.
-
-Identify "Work Items" (files that are new or need re-processing).
-
-Phase B (Download & Process): * Loop through your "Work Items" using the same open session.
-
-Download each file to a local temporary buffer or disk.
-
-Update DB status to PROCESSING.
-
-Close Connection: Once all files from that specific poll are handled (or queued), close the session.
-
-2. Refined Workflow with a "Staging" Step
-To make this robust, I recommend adding a "Staging" step in your DB to avoid long-running SFTP sessions if you have thousands of files.
-
-Step	Action	Connection State
-1. Discovery	Fetch file list; Batch insert NEW records into DB.	Open/Close
-2. Processing	Query DB for NEW records; Download and Process.	Open/Close
-Why separate them? If the processing of one file takes 10 minutes (e.g., heavy data parsing), keeping an SFTP session open that entire time is risky—the server might time out or the connection might flicker.
-
-3. Recommended Code Structure
-In Spring Boot, you can use the Jsch library or the more modern sshj. Using a ResourcePool or a simple Service wrapper is the cleanest way to manage this.
-
-Example Service Skeleton
-Java
 @Service
-public class FileMonitoringService {
+public class SftpService {
 
-    @Scheduled(fixedDelay = 60000) // Poll every minute
-    public void monitorRemoteFolder() {
-        // 1. Open Session
-        SftpSession session = sftpFactory.getSession(); 
-        
+    private final String HOST = "localhost";
+    private final int PORT = 2222;
+    private final String USER = "myuser";
+    private final String PASSWORD = "mypassword";
+
+    public List<FileDetail> listFileDetails(String directoryPath) throws JSchException, SftpException {
+        List<FileDetail> details = new ArrayList<>();
+        JSch jsch = new JSch();
+        Session session = null;
+        ChannelSftp channelSftp = null;
+
         try {
-            // Phase A: Identify
-            List<RemoteFile> remoteFiles = session.list("/incoming");
-            List<RemoteFile> filesToProcess = filterNewFiles(remoteFiles);
+            session = jsch.getSession(USER, HOST, PORT);
+            session.setPassword(PASSWORD);
+            session.setConfig("StrictHostKeyChecking", "no");
+            session.connect();
 
-            // Phase B: Process
-            for (RemoteFile file : filesToProcess) {
-                // Mark DB as IN_PROGRESS
-                dbService.markAsProcessing(file.getName());
-                
-                // Use the SAME session to download
-                InputStream stream = session.read(file.getFullPath());
-                businessLogic.process(stream);
-                
-                // Mark DB as COMPLETED
-                dbService.markAsCompleted(file.getName());
+            channelSftp = (ChannelSftp) session.openChannel("sftp");
+            channelSftp.connect();
+
+            Vector<ChannelSftp.LsEntry> fileList = channelSftp.ls(directoryPath);
+            
+            for (ChannelSftp.LsEntry entry : fileList) {
+                if (!entry.getAttrs().isDir()) {
+                    SftpATTRS attrs = entry.getAttrs();
+                    
+                    details.add(new FileDetail(
+                        entry.getFilename(),
+                        attrs.getSize(),
+                        convertToLocalDateTime(attrs.getMTime()), // Modified Time
+                        convertToLocalDateTime(attrs.getATime()), // Access Time
+                        attrs.getPermissionsString()
+                    ));
+                }
             }
         } finally {
-            // Always close in finally block
-            session.close();
+            if (channelSftp != null) channelSftp.disconnect();
+            if (session != null) session.disconnect();
         }
+        return details;
+    }
+
+    /**
+     * Converts JSch epoch seconds to LocalDateTime
+     */
+    private LocalDateTime convertToLocalDateTime(int epochSeconds) {
+        return LocalDateTime.ofInstant(
+            Instant.ofEpochSecond(epochSeconds), 
+            ZoneId.systemDefault()
+        );
     }
 }
-Pro-Tip: The "Atomic" Problem
-When using SFTP, there is a risk of reading a file that is still being uploaded by the source. To prevent this without "opening twice," check the file size or timestamp:
-
-Record the file size in the first loop.
-
-Wait 5 seconds.
-
-Check the size again.
-
-If the size is identical, it's safe to download.
-
-Alternatively, many systems have the sender upload file.csv.tmp and rename it to file.csv only when finished. You can configure your code to only "see" files that do not end in .tmp.
-
-How do you plan to handle the file after processing—will you delete it from the remote server or move it to an "archive" folder?
-
-You said
-ok, first, we can assume remote server only keep like 7 days files, will not be too many, like hundreds level at most ... second, I don't have to "process" "delta new" files during sftp session, instead, only download those in local directory, btw, I like the idea of "list and filter" ... I am thinking, if I can "remember" a latest time we downloaded last, we could filter by comparing datetime ... could you make some revision and suggestions?
-
-Gemini said
-Since you are dealing with a relatively small volume of files (hundreds) and a short retention window (7 days), your idea of using a Watermark Timestamp (the "latest time") is excellent. It simplifies the logic significantly.
-
-However, relying only on a timestamp can be risky if two files arrive at the exact same second or if the system clocks between your app and the SFTP server are slightly out of sync.
-
-Here is a revised, robust design for Option 1 using a Hybrid Filter (Timestamp + Filename).
-
-1. The Metadata Table (The "Watermark")
-Instead of tracking every single file forever, you only need to track what has been successfully downloaded.
-
-Table: sync_metadata
-| Column | Description |
-| :--- | :--- |
-| last_sync_time | The lastModified timestamp of the newest file successfully downloaded. |
-| processed_filenames | (Optional) A list or sub-table of files from that specific "last sync second" to handle collisions. |
-
-2. The Revised Workflow
-By separating the Sync (SFTP to Local) from the Process (Local to Logic), you make the system much more resilient.
-
-Phase A: Discovery & Filter
-Open SFTP Session.
-
-Fetch Watermark: Pull the last_sync_time from your DB.
-
-List & Filter: List files and keep only those where file.mtime >= last_sync_time.
-
-Refine: Remove files that are already in your "Local Storage" (checking by filename) to avoid re-downloading the exact file from the last sync second.
-
-Phase B: Batch Download
-Stream to Local: Download the filtered files to your /local/inbound folder.
-
-Update Watermark: Find the max mtime among the files you just downloaded and save it to the DB.
-
-Close SFTP Session.
-
-Phase C: Local Processing (Decoupled)
-A separate service (or a different method in the same service) watches the /local/inbound folder.
-
-It processes the files and moves them to /local/archive once done.
-
-3. Why this is better
-Performance: Listing 500 files and checking a single timestamp in memory is nearly instantaneous.
-
-Resiliency: If the SFTP connection drops during download, your last_sync_time hasn't updated yet. The next run will simply pick up where it left off.
-
-Decoupling: Your SFTP session stays open only for the duration of the transfer. If your "processing" logic takes a long time (e.g., parsing a huge CSV into a DB), it doesn't hog the SFTP connection.
-
-4. Implementation Tips
-Handling the "Same Second" Collision
-If File_A and File_B both have a timestamp of 10:00:00, and your last sync ended at 10:00:00, a simple > filter might miss File_B.
-The Fix: Use >= and keep a small cache (or DB check) of filenames processed within the last 24 hours to skip duplicates.
-
-Dealing with "Partial Uploads"
-Since you are downloading locally first, you must ensure the file is complete.
-The Fix: ```java
-// Inside your loop
-if (remoteFile.getAttrs().getMTime() > (System.currentTimeMillis() - 10000)) {
-// File was modified in the last 10 seconds, might still be uploading.
-// Skip it for this run.
-continue;
-}
-
-
-### The "7-Day" Cleanup
-Since the remote server deletes files after 7 days, your local `/local/archive` should probably do the same to save disk space. A simple `find /local/archive -mtime +7 -delete` (or a Java equivalent) will keep things tidy.
-
----
-
-## Summary of the Logic Flow
-
-
-
-1. **DB:** `SELECT val FROM settings WHERE key = 'LAST_MTIME'`
-2. **SFTP:** `LS /remote` -> Filter `mtime >= LAST_MTIME`
-3. **Local:** `GET` files to `/tmp/`
-4. **DB:** `UPDATE settings SET val = [New Max Mtime]`
-5. **App:** Process files from `/tmp/` at your leisure.
-
-Does this separation of "Download" and "Process" fit your application's resource constraints?
-You said
-ok, we can temporarily ignore phase c ... let's focus on phase a and b .... first, about the db table design, the above is not very clear to me ... basically, I would keep infos for each scheduler run ... likely, columns, ID (generated), last_run_time (maybe redundant, but might be better to keep it), latest_file_time_synced (latest file time), latest_file_downloaded (json string of filenames on latest file time, to handle if multiple files with same latest_file_time), processed_filenames (json string of a list of filenames downloaded in this round scheduler run). So, when seeing >= files during current run, need to be careful to compare with latest_file_downloaded ... is this a good design? any issue? any suggestion?
-
-Gemini said
-Your design is on the right track, especially the focus on handling collisions (multiple files with the same timestamp). However, using a JSON string for processed_filenames within a "run-based" table can make querying and error recovery a bit messy.
-
-If a run fails halfway through downloading 50 files, your JSON string becomes an "all or nothing" record that is hard to verify.
-
-Here is a refined table design and a logic flow that handles the "Same Second" problem more cleanly.
-
-1. Suggested DB Design: The "Two-Table" Approach
-Instead of one complex table, use a Metadata table for the "Watermark" and a History table for individual files.
-
-Table A: sync_watermark (The Global Pointer)
-This table only ever has one row. It tells the system where it left off.
-
-latest_mtime: The lastModified timestamp of the newest file synced.
-
-updated_at: When the last successful run finished.
-
-Table B: file_sync_history (The Audit Trail)
-This is where you handle the "Same Second" and "Partial Failure" issues.
-
-file_name (Indexed): The unique filename.
-
-file_mtime: The timestamp of that file.
-
-sync_status: SUCCESS or FAILED.
-
-run_id: Links back to which scheduler run handled it.
-
-2. Why this is safer than JSON
-Atomicity: You can update the status of each file individually. If the 3rd file in a list of 10 fails, you record it as FAILED and move to the 4th.
-
-Clean Filtering: Instead of parsing a JSON string in Java to see if a file was downloaded, you can run a simple SQL query: SELECT count(*) FROM file_sync_history WHERE file_name = ? AND file_mtime = ?.
-
-Automatic Cleanup: Since you only care about files from the last 7 days, you can run a weekly task to delete old rows from file_sync_history.
-
-3. The Logic Flow (Revised Phase A & B)
-Here is how to handle the >= logic using the design above:
-
-Step 1: Fetch Watermark
-Get the latest_mtime from sync_watermark.
-
-Step 2: SFTP List & Filter
-Fetch all files where mtime >= latest_mtime.
-
-Crucial Rule: If a file's mtime is exactly equal to latest_mtime, check file_sync_history. If it exists there with SUCCESS, skip it.
-
-Step 3: The Download Loop
-For each candidate file:
-
-Insert a record into file_sync_history with status IN_PROGRESS.
-
-Download the file from SFTP to Local.
-
-Update the status to SUCCESS.
-
-Local Pointer Update: Keep track of the highest mtime encountered during this loop.
-
-Step 4: Update Watermark
-Once the loop finishes, update sync_watermark.latest_mtime with the highest mtime you found.
-
-4. Addressing your JSON Idea
-If you prefer to stick to one table with JSON strings, here are the risks:
-
-Concurrency: If you ever scale to two instances of the app, they might both read the same "Last Run" row and try to download the same files simultaneously.
-
-Size Limits: If a single "run" picks up 500 files, your JSON string of filenames might exceed the column's character limit.
-
-Searching: SQL is very fast at finding a filename in a indexed column; it is very slow at finding a filename inside a JSON string.
-
-Final Suggestion
-Keep it simple. A File-per-Row history table is the "Spring Way." It allows you to use Spring Data JPA easily:
-
-Java
-// Logic for Step 2
-boolean alreadyExists = historyRepo.existsByFileNameAndFileMtime(file.getName(), file.getMtime());
-if (!alreadyExists) {
-    download(file);
-}
-This approach makes your "Phase A" filter extremely accurate and prevents the "Phase B" download from ever repeating work, even if the scheduler crashes and restarts 5 seconds later.
-
-Does the idea of a separate History table feel too heavy for your use case, or do you see the benefit in avoiding JSON parsing?
-
-You said
-I very like the two table design idea ... this even covers my next "feature request", which is to make a "retry" mechanism ... is that right? please give more details if I am understanding this correctly ...
-
-Gemini said
-You are exactly right! The two-table design is the standard industry pattern because it transforms a "fragile" script into a "resilient" state machine. By moving the state out of your application memory and into the database, you get a "Save Point" for every single file.
-
-Here is how that design naturally supports a Retry Mechanism and why it's superior for production environments.
-
-1. The "Retry" Mechanism in Detail
-With the file_sync_history table, a "Retry" isn't a special complex feature—it’s just a side effect of how you query the data.
-
-How it works:
-When the scheduler runs, your SQL query changes from "What is new?" to "What is incomplete?".
-
-The Query Logic:
-Instead of just looking for files where mtime >= watermark, you look for:
-
-New Files: mtime > watermark
-
-Unfinished Business: mtime <= watermark AND sync_status != 'SUCCESS'
-
-Scenario: The Network Fails
-Run 1: You detect 10 files. You successfully download 5. The network dies on the 6th.
-
-DB State: 5 rows marked SUCCESS, 1 row marked FAILED (or IN_PROGRESS), and 4 files never got a row at all.
-
-Run 2 (The Recovery):
-
-The watermark hasn't updated yet (because the whole batch didn't finish, or you only update it per-file).
-
-The system sees the FAILED row and tries to download it again.
-
-The system sees the 4 missing files and creates new rows for them.
-
-2. Refining the History Table for Retries
-To make the retry mechanism robust, add two specific columns to your file_sync_history table:
-
-Column	Type	Purpose
-retry_count	Integer	Increment this every time a download fails.
-error_message	Text	Store the exception (e.g., "Connection Timeout") for debugging.
-last_attempt	Timestamp	Prevent "Tight-Loop Retries." Only retry if the last attempt was >X minutes ago.
-3. The "State Machine" of a File
-By using this table, every file goes through a lifecycle. This makes your Phase A and B look like this:
-
-Discovery: If file doesn't exist in file_sync_history, insert as PENDING.
-
-Locking: Use UPDATE ... SET status = 'IN_PROGRESS' WHERE status IN ('PENDING', 'FAILED') AND retry_count < 3.
-
-Tip: This prevents two threads from downloading the same file.
-
-Execution: Attempt SFTP download.
-
-Finalize: * Success: Update to SUCCESS.
-
-Failure: Update to FAILED, increment retry_count, and log the error.
-
-4. Handling the "Watermark" with Retries
-There are two ways to update your latest_mtime (Watermark) when retries are involved:
-
-A. The Conservative Approach (Recommended)
-Only update the sync_watermark table when all files in a batch are SUCCESS.
-
-Pros: Very safe.
-
-Cons: If one file consistently fails, the watermark stays "old," and your LS command keeps fetching the same 100 files over and over.
-
-B. The Independent Approach
-Update the sync_watermark to the max mtime you successfully processed, even if some failed.
-
-Pros: Keeps the "Discovery" phase fast.
-
-Cons: You must ensure your "Retry" logic explicitly queries for status = 'FAILED' because those files will now be "behind" the watermark.
-
-Summary of Benefits
-Visibility: You can build a simple UI or API endpoint to see exactly which files failed and why.
-
-Manual Override: If a file keeps failing, a developer can manually set the status to SUCCESS in the DB to make the system skip it.
-
-No Data Loss: Even if the SFTP server deletes the file after 7 days, your DB record remains as proof that "We tried 3 times and it failed."
-
-Does this "State Machine" approach feel like it covers the edge cases you were worried about?
-
-You said
-let's go details ... if we consider, after filter by latest mtime in sync_watermark, we have a "new delta" file list, then we sort this list by mtime and start downloading one by one. for each file downloaded, we insert one row in file_sync_history, when success, we update the latest mtime in sync_watermark ... will this work perfectly? btw, for those mtime=latest_mtime in the filtered list, we just do an additional check, alreadyExists = historyRepo.existsByFileNameAndFileMtime, or we just download those again arbitrarily, only very few of them anyways ...
-
-Gemini said
-Your logic is very close to "perfect," but there is one specific Edge Case that could cause you to miss files if you update the sync_watermark for every single file success.
-
-The "Same-Second" Risk
-If you have three files (A,B,C) all with the same timestamp (e.g., 10:00:00), and your loop does this:
-
-Download A → Success → Update Watermark to 10:00:00.
-
-Download B → Network Crash!
-
-The scheduler stops.
-
-On the next run, your filter is mtime >= 10:00:00. You will see A,B, and C.
-
-You skip A (it's in the history).
-
-You download B and C.
-This works. However, if your filter was mtime > 10:00:00 (strict greater than), you would have missed B and C forever. Since you confirmed you will use >=, you are safe.
-
-Refined Execution Flow
-To make this bulletproof and handle the Retry requirement you mentioned, I suggest this sequence for your Phase A and B:
-
-1. The Discovery (Phase A)
-Fetch W = sync_watermark.latest_mtime.
-
-List SFTP files where file.mtime >= W.
-
-Sort the list by mtime ascending (Oldest to Newest).
-
-Filter out any file that already has a SUCCESS record in file_sync_history for that specific filename + mtime.
-
-2. The Download Loop (Phase B)
-For each file in your filtered list:
-
-Insert/Update History: Create a record in file_sync_history with status = IN_PROGRESS and attempt_count++.
-
-Download: Perform the SFTP get().
-
-Update History: Mark as SUCCESS.
-
-Update Watermark: * Wait! Do not update the global sync_watermark yet if you want to be 100% safe.
-
-Only update the sync_watermark after the entire loop finishes, using the mtime of the last successful file in your sorted list.
-
-Why wait until the end of the loop?
-If you update the watermark row in the DB 100 times for 100 files, you are creating 100 unnecessary DB transactions.
-
-Better approach:
-
-Keep a local variable maxMtimeSuccessfullySynced during the loop.
-
-After the loop completes, do one DB update: UPDATE sync_watermark SET latest_mtime = :maxMtime.
-
-Answering your "Arbitrary Download" question
-"...for those mtime=latest_mtime... we just download those again arbitrarily, only very few of them anyways..."
-
-I wouldn't recommend downloading them arbitrarily. If your "Phase C" (processing) triggers an email or a bank transaction, downloading/processing twice might be a problem.
-
-Since you are already building the file_sync_history table, the check existsByFileNameAndFileMtime is very "cheap" (fast) for the database. It's better to be clean: Check the DB, and only download if it's not there.
-
-Handling the "Retry" properly
-With this design, if a file fails:
-
-The file_sync_history will show FAILED.
-
-The sync_watermark will not move forward past that file's timestamp (if you use the "Conservative" approach).
-
-On the next run, the mtime >= W filter will find that failed file again.
-
-Your logic sees it in the history with status = FAILED, so it attempts to download it again.
-
-Summary of the "Perfect" Design
-Step	Action
-Step 1	W = select watermark
-Step 2	List = sftp.ls(mtime >= W)
-Step 3	List = List.filter(file -> !db.isSuccess(file))
-Step 4	Sort List by mtime ASC
-Step 5	For each file: Download -> db.markSuccess(file)
-Step 6	update watermark = last_successful_file.mtime
-This handles the "Same-Second" issue, supports retries, and minimizes DB overhead. Does this sequence align with how you were envisioning the code?
-
-You said
-please give the detailed two table design based on above
-
-Gemini said
-To implement this robustly in Spring Boot, here is the detailed schema and the logic flow. Using two tables ensures that even if the SFTP server has "jitter" (files appearing with identical timestamps), your system remains idempotent (never processes the same file twice) and resilient (automatically retries failures).
-
-1. Database Schema Design
-Table 1: sync_watermark
-This table acts as a global pointer. It stores the "high-water mark" so you don't have to scan the entire remote history every time.
-
-Column	Type	Constraints	Description
-id	Integer	Primary Key	Usually just 1 row (ID=1).
-latest_mtime	Timestamp	Not Null	The lastModified time of the newest successfully synced file.
-last_run_started	Timestamp		Used for monitoring/heartbeat.
-Table 2: file_sync_history
-This table tracks every individual file. It handles the "Same-Second" collisions and the retry logic.
-
-Column	Type	Constraints	Description
-file_name	String	Primary Key (Part 1)	The unique name of the file.
-file_mtime	Timestamp	Primary Key (Part 2)	The timestamp from the SFTP server.
-sync_status	Enum		PENDING, IN_PROGRESS, SUCCESS, FAILED.
-retry_count	Integer	Default 0	Number of failed download attempts.
-local_path	String		Where the file was saved locally.
-updated_at	Timestamp		Last time this record was touched.
-Note: Making (file_name, file_mtime) a composite primary key prevents the system from ever downloading the same version of a file twice.
-
-2. The Logic Implementation
-Here is how the service should execute the "Phase A & B" loop within your @Scheduled task.
-
-Step 1: Initialization
-Read Watermark: W = SELECT latest_mtime FROM sync_watermark WHERE id = 1.
-
-Open SFTP: Establish a single session.
-
-Step 2: Discovery (Phase A)
-List Files: Get all files from the remote directory where mtime >= W.
-
-Filter in Memory: * If mtime > W: It’s definitely new.
-
-If mtime == W: Query the DB: SELECT status FROM file_sync_history WHERE file_name = :name AND file_mtime = :mtime.
-
-Skip if status is SUCCESS.
-
-Include if status is FAILED (this is your retry) or if the record doesn't exist.
-
-Sort: Order your final list by mtime Ascending (Oldest to Newest).
-
-Step 3: Execution (Phase B)
-Loop through the sorted list:
-
-DB Check/Lock: Create or update the file_sync_history row to IN_PROGRESS.
-
-Download: sftp.get(remotePath, localPath).
-
-Success Update: * Set file_sync_history.sync_status = 'SUCCESS'.
-
-Update local variable maxSyncedMtime = currentFile.mtime.
-
-Failure Update: * If an exception occurs, set status = 'FAILED' and increment retry_count. Break the loop or continue based on your preference (breaking is safer for ordered data).
-
-Step 4: Finalize
-Update Watermark: UPDATE sync_watermark SET latest_mtime = :maxSyncedMtime.
-
-Close SFTP: Release the connection.
-
-3. Why this handles your requirements
-The Retry Mechanism
-If a download fails, the sync_watermark is not updated (or is only updated to the last successful file's time). On the next run, the same file will be picked up by the mtime >= W filter. Your code will see the FAILED status and try again.
-
-Handling "Same-Second" Files
-If 5 files arrive at 12:00:00:
-
-In Run 1, the watermark becomes 12:00:00.
-
-In Run 2, the SFTP list returns those 5 files again because they match >= 12:00:00.
-
-Your Filter checks the file_sync_history table, sees they are all SUCCESS, and ignores them. No redundant downloads.
-
-Performance
-SFTP: You only list files changed recently.
-
-Database: The history table will eventually grow. Since the server only keeps 7 days of files, you can add a "Cleanup" task to delete file_sync_history rows older than 14 days:
-DELETE FROM file_sync_history WHERE file_mtime < NOW() - INTERVAL '14 days'.
-
-Does this database structure align with the JPA entities or SQL tables you are planning to build?
