@@ -1,0 +1,169 @@
+
+The right abstraction: make a stateless SFTP client service
+
+Instead of exposing Session or ChannelSftp, expose operations.
+
+✅ Good Spring component
+@Component
+public class SftpClient {
+
+    public void upload(Path local, String remote) {
+        execute(channel -> channel.put(local.toString(), remote));
+    }
+
+    public void download(String remote, Path local) {
+        execute(channel -> channel.get(remote, local.toString()));
+    }
+
+    public Vector<ChannelSftp.LsEntry> ls(String path) {
+        return executeWithResult(channel -> channel.ls(path));
+    }
+
+    public void mkdir(String path) {
+        execute(channel -> channel.mkdir(path));
+    }
+
+    private void execute(SftpOperation operation) {
+        executeWithResult(channel -> {
+            operation.run(channel);
+            return null;
+        });
+    }
+
+    private <T> T executeWithResult(SftpFunction<T> fn) {
+        Session session = null;
+        ChannelSftp channel = null;
+
+        try {
+            session = createSession();
+            session.connect();
+
+            channel = (ChannelSftp) session.openChannel("sftp");
+            channel.connect();
+
+            return fn.apply(channel);
+
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        } finally {
+            if (channel != null && channel.isConnected()) {
+                channel.disconnect();
+            }
+            if (session != null && session.isConnected()) {
+                session.disconnect();
+            }
+        }
+    }
+}
+
+@FunctionalInterface
+interface SftpOperation {
+    void run(ChannelSftp channel) throws Exception;
+}
+
+@FunctionalInterface
+interface SftpFunction<T> {
+    T apply(ChannelSftp channel) throws Exception;
+}
+
+Why this is good
+
+✔ Spring bean is stateless
+
+✔ New session/channel per call
+
+✔ Safe under concurrency
+
+✔ Clean API for callers
+
+✔ Easy to add retries / logging / metrics later
+
+“But I want multiple operations in one connection”
+
+Totally valid use case 👍
+
+Do it explicitly, not via Spring lifecycle
+public void withSftp(Consumer<ChannelSftp> consumer) {
+    Session session = null;
+    ChannelSftp channel = null;
+
+    try {
+        session = createSession();
+        session.connect();
+
+        channel = (ChannelSftp) session.openChannel("sftp");
+        channel.connect();
+
+        consumer.accept(channel);
+
+    } finally {
+        if (channel != null && channel.isConnected()) channel.disconnect();
+        if (session != null && session.isConnected()) session.disconnect();
+    }
+}
+
+
+Usage:
+
+sftpClient.withSftp(channel -> {
+    channel.mkdir("/inbox");
+    channel.put("a.txt", "/inbox/a.txt");
+    channel.put("b.txt", "/inbox/b.txt");
+});
+
+
+✔ One connection
+✔ Clear ownership
+✔ Still thread-safe
+
+
+
+@Component
+public class SftpSessionFactory {
+
+    private final SftpProperties props;
+
+    public SftpSessionFactory(SftpProperties props) {
+        this.props = props;
+    }
+
+    public Session createSession() throws JSchException {
+        JSch jsch = new JSch();
+
+        if (props.getKnownHostsPath() != null) {
+            jsch.setKnownHosts(props.getKnownHostsPath());
+        }
+
+        if (props.getPrivateKeyPath() != null) {
+            if (props.getPrivateKeyPassphrase() != null) {
+                jsch.addIdentity(
+                    props.getPrivateKeyPath(),
+                    props.getPrivateKeyPassphrase()
+                );
+            } else {
+                jsch.addIdentity(props.getPrivateKeyPath());
+            }
+        }
+
+        Session session = jsch.getSession(
+            props.getUsername(),
+            props.getHost(),
+            props.getPort()
+        );
+
+        if (props.getPassword() != null) {
+            session.setPassword(props.getPassword());
+        }
+
+        Properties config = new Properties();
+        config.put(
+            "StrictHostKeyChecking",
+            props.isStrictHostKeyChecking() ? "yes" : "no"
+        );
+        session.setConfig(config);
+
+        return session; // 👈 NOT connected yet
+    }
+}
+
+
